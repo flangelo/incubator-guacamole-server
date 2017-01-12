@@ -77,6 +77,11 @@ typedef struct guac_common_surface_heat_cell {
      */
     int oldest_entry;
 
+    /**
+     * Flag indicating whether this cell is rendered using lossy encoding.
+     */
+    int lossy;
+
 } guac_common_surface_heat_cell;
 
 /**

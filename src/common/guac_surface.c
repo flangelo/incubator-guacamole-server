@@ -82,12 +82,17 @@
  * 100 is the highest quality/largest file size, and 0 is the lowest
  * quality/smallest file size.
  */
-#define GUAC_SURFACE_JPEG_IMAGE_QUALITY 90
+#define GUAC_SURFACE_JPEG_IMAGE_QUALITY 80
 
 /**
- * The framerate which, if exceeded, indicates that JPEG is preferred.
+ * The framerate which, if exceeded, indicates that lossy encoding is preferred.
  */
-#define GUAC_COMMON_SURFACE_JPEG_FRAMERATE 3
+#define GUAC_COMMON_SURFACE_LOSSY_FRAMERATE 3
+
+/**
+ * The threshold between two refreshes to repair a lossy frame.
+ */
+#define GUAC_COMMON_SURFACE_REPAIR_LOSSY_THRESHOLD 4000
 
 /**
  * Minimum JPEG bitmap size (area). If the bitmap is smaller than this threshold,
@@ -100,7 +105,7 @@
  * 100 is the highest quality/largest file size, and 0 is the lowest
  * quality/smallest file size.
  */
-#define GUAC_SURFACE_WEBP_IMAGE_QUALITY 90
+#define GUAC_SURFACE_WEBP_IMAGE_QUALITY 80
 
 /**
  * The JPEG compression min block size. This defines the optimal rectangle block
@@ -278,6 +283,9 @@ static unsigned int __guac_common_surface_calculate_framerate(
 
     int x, y;
 
+    /* Get current time */
+    guac_timestamp now = guac_timestamp_current();
+
     /* Calculate heat map dimensions */
     int heat_width = GUAC_COMMON_SURFACE_HEAT_DIMENSION(surface->width);
 
@@ -313,8 +321,7 @@ static unsigned int __guac_common_surface_calculate_framerate(
                 latest_entry = GUAC_COMMON_SURFACE_HEAT_CELL_HISTORY_SIZE - 1;
 
             /* Calculate elapsed time covering entire history for this cell */
-            int elapsed_time = heat_cell->history[latest_entry]
-                             - heat_cell->history[oldest_entry];
+            int elapsed_time = now - heat_cell->history[oldest_entry];
 
             /* Calculate and add framerate */
             if (elapsed_time)
@@ -435,7 +442,7 @@ static int __guac_common_surface_should_use_jpeg(guac_common_surface* surface,
      * - frame rate is high enough
      * - image size is large enough
      * - PNG is not more optimal based on image contents */
-    return framerate >= GUAC_COMMON_SURFACE_JPEG_FRAMERATE
+    return framerate >= GUAC_COMMON_SURFACE_LOSSY_FRAMERATE
         && rect_size > GUAC_SURFACE_JPEG_MIN_BITMAP_SIZE
         && __guac_common_surface_png_optimality(surface, rect) < 0;
 
@@ -468,8 +475,145 @@ static int __guac_common_surface_should_use_webp(guac_common_surface* surface,
     /* WebP is preferred if:
      * - frame rate is high enough
      * - PNG is not more optimal based on image contents */
-    return framerate >= GUAC_COMMON_SURFACE_JPEG_FRAMERATE
+    return framerate >= GUAC_COMMON_SURFACE_LOSSY_FRAMERATE
         && __guac_common_surface_png_optimality(surface, rect) < 0;
+
+}
+
+/**
+ * Repair lossy rectangles and add them to the dirty queue if the rectangles
+ * no longer are classified as lossy.
+ *
+ * @param surface
+  *     The surface to be repaired.
+*/
+static void __guac_common_surface_repair_lossy(guac_common_surface* surface) {
+
+    int x, y;
+    guac_timestamp now = guac_timestamp_current();
+
+    /* Calculate heat map dimensions */
+    int heat_width = GUAC_COMMON_SURFACE_HEAT_DIMENSION(surface->width);
+
+    /* Set minimum X/Y coordinates for the surface */
+    int min_x = 0;
+    int min_y = 0;
+
+    /* Calculate maximum X/Y coordinates intersecting the surface */
+    int max_x = min_x + (surface->width  - 1) / GUAC_COMMON_SURFACE_HEAT_CELL_SIZE;
+    int max_y = min_y + (surface->height - 1) / GUAC_COMMON_SURFACE_HEAT_CELL_SIZE;
+
+    /* Get start of buffer */
+    guac_common_surface_heat_cell* heat_row = surface->heat_map;
+
+    /* Iterate over all heat map cells */
+    for (y = min_y; y <= max_y; y++) {
+
+        /* Get current row of heat map */
+        guac_common_surface_heat_cell* heat_cell = heat_row;
+
+        /* For each cell in subset of row */
+        for (x = min_x; x <= max_x; x++) {
+
+            if (heat_cell->lossy) {
+
+                /* Calculate indicies for latest and oldest history entries */
+                int oldest_entry = heat_cell->oldest_entry;
+                int latest_entry = oldest_entry - 1;
+                if (latest_entry < 0)
+                    latest_entry = GUAC_COMMON_SURFACE_HEAT_CELL_HISTORY_SIZE - 1;
+
+                /* Calculate elapsed time since last update for this cell */
+                int elapsed_time = now - heat_cell->history[latest_entry];
+
+                if (elapsed_time > GUAC_COMMON_SURFACE_REPAIR_LOSSY_THRESHOLD) {
+
+                    heat_cell->lossy = 0;
+                    guac_common_rect update_rect;
+                    guac_common_rect_init(&update_rect,
+                            x * GUAC_COMMON_SURFACE_HEAT_CELL_SIZE,
+                            y * GUAC_COMMON_SURFACE_HEAT_CELL_SIZE,
+                            GUAC_COMMON_SURFACE_HEAT_CELL_SIZE,
+                            GUAC_COMMON_SURFACE_HEAT_CELL_SIZE);
+
+                    guac_common_surface_bitmap_rect* rect;
+
+                    /* Add rectangle to bitmap queue */
+                    rect = &(surface->bitmap_queue[surface->bitmap_queue_length++]);
+                    rect->rect = update_rect;
+                    rect->flushed = 0;
+
+                    surface->dirty = 1;
+
+                }
+            }
+
+            /* Advance to next heat map cell */
+            heat_cell++;
+
+        }
+
+        /* Next heat map row */
+        heat_row += heat_width;
+
+    }
+
+}
+
+/**
+ * Mark the lossy flag for all heat map cells in a given rectangle with the
+ * given lossy flag value.
+ *
+ * @param surface
+ *     The surface containing the heat map cells to be updated.
+ *
+ * @param rect
+ *     The rectangle containing the heat map cells to be updated.
+ *
+ * @param lossy
+ *     The lossy flag to update the heat cells.
+ */
+static void __guac_common_surface_mark_lossy(guac_common_surface* surface,
+        const guac_common_rect* rect, int lossy) {
+
+    int x, y;
+
+    /* Calculate heat map dimensions */
+    int heat_width = GUAC_COMMON_SURFACE_HEAT_DIMENSION(surface->width);
+
+    /* Calculate minimum X/Y coordinates intersecting given rect */
+    int min_x = rect->x / GUAC_COMMON_SURFACE_HEAT_CELL_SIZE;
+    int min_y = rect->y / GUAC_COMMON_SURFACE_HEAT_CELL_SIZE;
+
+    /* Calculate maximum X/Y coordinates intersecting given rect */
+    int max_x = min_x + (rect->width  - 1) / GUAC_COMMON_SURFACE_HEAT_CELL_SIZE;
+    int max_y = min_y + (rect->height - 1) / GUAC_COMMON_SURFACE_HEAT_CELL_SIZE;
+
+    /* Get start of buffer at given coordinates */
+    guac_common_surface_heat_cell* heat_row =
+        surface->heat_map + min_y * heat_width + min_x;
+
+    /* Update all heat map cells which intersect with rectangle */
+    for (y = min_y; y <= max_y; y++) {
+
+        /* Get current row of heat map */
+        guac_common_surface_heat_cell* heat_cell = heat_row;
+
+        /* For each cell in subset of row */
+        for (x = min_x; x <= max_x; x++) {
+
+            /* Set lossy flag */
+            heat_cell->lossy = lossy;
+
+            /* Advance to next heat map cell */
+            heat_cell++;
+
+        }
+
+        /* Next heat map row */
+        heat_row += heat_width;
+
+    }
 
 }
 
@@ -1316,6 +1460,9 @@ static void __guac_common_surface_flush_to_png(guac_common_surface* surface) {
         cairo_surface_destroy(rect);
         surface->realized = 1;
 
+        /* Clear the lossy flag for the dirty rect */
+        __guac_common_surface_mark_lossy(surface, &surface->dirty_rect, 0);
+
         /* Surface is no longer dirty */
         surface->dirty = 0;
 
@@ -1364,6 +1511,9 @@ static void __guac_common_surface_flush_to_jpeg(guac_common_surface* surface) {
         cairo_surface_destroy(rect);
         surface->realized = 1;
 
+        /* Mark the dirty rect rendering quality */
+        __guac_common_surface_mark_lossy(surface, &surface->dirty_rect, 1);
+
         /* Surface is no longer dirty */
         surface->dirty = 0;
 
@@ -1411,6 +1561,9 @@ static void __guac_common_surface_flush_to_webp(guac_common_surface* surface) {
 
         cairo_surface_destroy(rect);
         surface->realized = 1;
+
+        /* Mark the dirty rect rendering quality */
+        __guac_common_surface_mark_lossy(surface, &surface->dirty_rect, 1);
 
         /* Surface is no longer dirty */
         surface->dirty = 0;
@@ -1525,6 +1678,9 @@ void guac_common_surface_flush(guac_common_surface* surface) {
 
     /* Flush complete */
     surface->bitmap_queue_length = 0;
+
+    /* Repair lossy areas which no longer should be rendered lossy */
+    __guac_common_surface_repair_lossy(surface);
 
 }
 
